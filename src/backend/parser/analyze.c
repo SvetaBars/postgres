@@ -101,6 +101,99 @@ static void transformLockingClause(ParseState *pstate, Query *qry,
 static bool test_raw_expression_coverage(Node *node, void *context);
 #endif
 
+static Node *
+resolve_having_aliases(ParseState *pstate, Query *qry, Node *node)
+{
+    if (node == NULL)
+        return NULL;
+
+    if (IsA(node, ColumnRef))
+    {
+        ColumnRef *cref = (ColumnRef *) node;
+        
+        if (list_length(cref->fields) == 1)
+        {
+            Node *field = (Node *) linitial(cref->fields);
+            if (IsA(field, String))
+            {
+                char *colname = strVal(field);
+                TargetEntry *tle;
+                
+                tle = findTargetlistEntrySQL92(pstate,
+                                               (Node *) cref,
+                                               &qry->targetList,
+                                               EXPR_KIND_HAVING);
+                
+                if (tle)
+                {   
+                    if (IsA(tle->expr, Aggref))
+                    {
+                        FuncCall *funcall = makeNode(FuncCall);
+                        funcall->funcname = list_make1(makeString("count"));
+                        funcall->args = NIL;
+                        funcall->agg_star = true;
+                        funcall->agg_distinct = false;
+                        funcall->func_variadic = false;
+                        funcall->over = NULL;
+                        funcall->location = -1;
+                        
+                        return (Node *) funcall;
+                    }
+                    else
+                    {
+                        return (Node *) copyObject(tle->expr);
+                    }
+                }
+                else
+                {
+                    elog(NOTICE, "DEBUG: Alias '%s' not found in targetList", colname);
+                }
+            }
+        }
+        return node;
+    }
+    else if (IsA(node, A_Expr))
+    {
+        A_Expr *expr = (A_Expr *) node;
+        
+        expr->lexpr = resolve_having_aliases(pstate, qry, expr->lexpr);
+        expr->rexpr = resolve_having_aliases(pstate, qry, expr->rexpr);
+        
+        return (Node *) expr;
+    }
+    else if (IsA(node, A_Const))
+    {
+        return node;
+    }
+    else if (IsA(node, List))
+    {
+        List *list = (List *) node;
+        ListCell *lc;
+        List *result = NIL;
+        
+        foreach(lc, list)
+        {
+            Node *elem = (Node *) lfirst(lc);
+            Node *new_elem = resolve_having_aliases(pstate, qry, elem);
+            result = lappend(result, new_elem);
+        }
+        
+        return (Node *) result;
+    }
+    else if (IsA(node, FuncCall))
+    {
+        FuncCall *fc = (FuncCall *) node;
+        if (fc->args)
+            fc->args = (List *) resolve_having_aliases(pstate, qry, (Node *) fc->args);
+        
+        return node;
+    }
+    else
+    {
+        elog(NOTICE, "DEBUG: Unknown node type %d, returning as is", nodeTag(node));
+        return node;
+    }
+}
 
 /*
  * parse_analyze_fixedparams
@@ -1447,12 +1540,23 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt,
 		markTargetListOrigins(pstate, qry->targetList);
 
 	/* transform WHERE */
-	qual = transformWhereClause(pstate, stmt->whereClause,
-								EXPR_KIND_WHERE, "WHERE");
+    qual = transformWhereClause(pstate, stmt->whereClause,
+                                EXPR_KIND_WHERE, "WHERE");
 
-	/* initial processing of HAVING clause is much like WHERE clause */
-	qry->havingQual = transformWhereClause(pstate, stmt->havingClause,
-										   EXPR_KIND_HAVING, "HAVING");
+    /* initial processing of HAVING clause with alias resolution */
+    if (stmt->havingClause)
+    {
+        Node *having_with_aliases; 
+        
+        having_with_aliases = resolve_having_aliases(pstate, qry, stmt->havingClause);
+        
+        qry->havingQual = transformWhereClause(pstate, having_with_aliases,
+                                               EXPR_KIND_HAVING, "HAVING");
+    }
+    else
+    {
+        qry->havingQual = NULL;
+    }
 
 	/*
 	 * Transform sorting/grouping stuff.  Do ORDER BY first because both

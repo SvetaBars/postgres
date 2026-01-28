@@ -54,5 +54,11 @@ extern TupleDesc expandRecordVariable(ParseState *pstate, Var *var,
 									  int levelsup);
 extern char *FigureColname(Node *node);
 extern char *FigureIndexColname(Node *node);
+extern TargetEntry *findTargetlistEntrySQL92(ParseState *pstate,
+                         Node *node,
+                         List **targetlist,
+                         ParseExprKind exprKind);
+extern TargetEntry *findTargetlistEntrySQL99(ParseState *pstate, Node *node,
+											 List **tlist, ParseExprKind exprKind);
 
 #endif							/* PARSE_TARGET_H */

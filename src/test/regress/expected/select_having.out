@@ -49,6 +49,42 @@ SELECT c, max(a) FROM test_having
  bbbb     |   5
 (2 rows)
 
+SELECT b, count(*) AS c FROM test_having
+	GROUP BY b HAVING c > 2 ORDER BY b;
+ b | c 
+---+---
+ 3 | 3
+ 4 | 4
+(2 rows)
+
+SELECT b, sum(a) AS s, max(a) AS mx FROM test_having
+	GROUP BY b HAVING s >= 12 AND mx >= 5 ORDER BY b;
+ b | s  | mx 
+---+----+----
+ 3 | 12 |  5
+ 4 | 30 |  9
+(2 rows)
+
+SELECT b, count(DISTINCT c) AS dc FROM test_having
+	GROUP BY b HAVING dc > 1 ORDER BY b;
+ b | dc 
+---+----
+ 3 |  2
+ 4 |  2
+(2 rows)
+
+SELECT b AS group_key, count(*) AS c FROM test_having
+	GROUP BY b HAVING group_key > 2 AND c > 0 ORDER BY group_key;
+ group_key | c 
+-----------+---
+         3 | 3
+         4 | 4
+(2 rows)
+
+SELECT 1 AS x, 2 AS x HAVING x > 0;
+ERROR:  HAVING "x" is ambiguous
+LINE 1: SELECT 1 AS x, 2 AS x HAVING x > 0;
+                                     ^
 -- test degenerate cases involving HAVING without GROUP BY
 -- Per SQL spec, these should generate 0 or 1 row, even without aggregates
 SELECT min(a), max(a) FROM test_having HAVING min(a) = max(a);

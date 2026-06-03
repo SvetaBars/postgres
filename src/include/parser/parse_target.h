@@ -4,7 +4,7 @@
  *	  handle target lists
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parse_target.h
@@ -54,5 +54,11 @@ extern TupleDesc expandRecordVariable(ParseState *pstate, Var *var,
 									  int levelsup);
 extern char *FigureColname(Node *node);
 extern char *FigureIndexColname(Node *node);
+extern TargetEntry *findTargetlistEntrySQL92(ParseState *pstate,
+                         Node *node,
+                         List **targetlist,
+                         ParseExprKind exprKind);
+extern TargetEntry *findTargetlistEntrySQL99(ParseState *pstate, Node *node,
+											 List **tlist, ParseExprKind exprKind);
 
 #endif							/* PARSE_TARGET_H */

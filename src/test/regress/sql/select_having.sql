@@ -30,6 +30,21 @@ SELECT c, max(a) FROM test_having
 	GROUP BY c HAVING count(*) > 2 OR min(a) = max(a)
 	ORDER BY c;
 
+
+SELECT b, count(*) AS c FROM test_having
+	GROUP BY b HAVING c > 2 ORDER BY b;
+
+SELECT b, sum(a) AS s, max(a) AS mx FROM test_having
+	GROUP BY b HAVING s >= 12 AND mx >= 5 ORDER BY b;
+
+SELECT b, count(DISTINCT c) AS dc FROM test_having
+	GROUP BY b HAVING dc > 1 ORDER BY b;
+
+SELECT b AS group_key, count(*) AS c FROM test_having
+	GROUP BY b HAVING group_key > 2 AND c > 0 ORDER BY group_key;
+
+SELECT 1 AS x, 2 AS x HAVING x > 0;
+
 -- test degenerate cases involving HAVING without GROUP BY
 -- Per SQL spec, these should generate 0 or 1 row, even without aggregates
 

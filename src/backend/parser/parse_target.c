@@ -3,7 +3,7 @@
  * parse_target.c
  *	  handle target lists
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -55,7 +55,253 @@ static List *ExpandSingleTable(ParseState *pstate, ParseNamespaceItem *nsitem,
 static List *ExpandRowReference(ParseState *pstate, Node *expr,
 								bool make_target_entry);
 static int	FigureColnameInternal(Node *node, char **name);
+TargetEntry *findTargetlistEntrySQL99(ParseState *pstate, Node *node,
+											 List **tlist, ParseExprKind exprKind);
+TargetEntry *findTargetlistEntrySQL92(ParseState *pstate, Node *node,
+											 List **tlist, ParseExprKind exprKind);
+static void
+checkTargetlistEntrySQL92(ParseState *pstate, TargetEntry *tle,
+						  ParseExprKind exprKind)
+{
+	switch (exprKind)
+	{
+		case EXPR_KIND_GROUP_BY:
+			/* reject aggregates and window functions */
+			if (pstate->p_hasAggs &&
+				contain_aggs_of_level((Node *) tle->expr, 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_GROUPING_ERROR),
+				/* translator: %s is name of a SQL construct, eg GROUP BY */
+						 errmsg("aggregate functions are not allowed in %s",
+								ParseExprKindName(exprKind)),
+						 parser_errposition(pstate,
+											locate_agg_of_level((Node *) tle->expr, 0))));
+			if (pstate->p_hasWindowFuncs &&
+				contain_windowfuncs((Node *) tle->expr))
+				ereport(ERROR,
+						(errcode(ERRCODE_WINDOWING_ERROR),
+				/* translator: %s is name of a SQL construct, eg GROUP BY */
+						 errmsg("window functions are not allowed in %s",
+								ParseExprKindName(exprKind)),
+						 parser_errposition(pstate,
+											locate_windowfunc((Node *) tle->expr))));
+			break;
+		case EXPR_KIND_ORDER_BY:
+			/* no extra checks needed */
+			break;
+		case EXPR_KIND_DISTINCT_ON:
+			/* no extra checks needed */
+			break;
+        case EXPR_KIND_HAVING:
+            break;
+		default:
+			elog(ERROR, "unexpected exprKind in checkTargetlistEntrySQL92");
+			break;
+	}
+}
 
+TargetEntry *
+findTargetlistEntrySQL99(ParseState *pstate, Node *node, List **tlist,
+						 ParseExprKind exprKind)
+{
+	TargetEntry *target_result;
+	ListCell   *tl;
+	Node	   *expr;
+
+	/*
+	 * Convert the untransformed node to a transformed expression, and search
+	 * for a match in the tlist.  NOTE: it doesn't really matter whether there
+	 * is more than one match.  Also, we are willing to match an existing
+	 * resjunk target here, though the SQL92 cases above must ignore resjunk
+	 * targets.
+	 */
+	expr = transformExpr(pstate, node, exprKind);
+
+	foreach(tl, *tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(tl);
+		Node	   *texpr;
+
+		/*
+		 * Ignore any implicit cast on the existing tlist expression.
+		 *
+		 * This essentially allows the ORDER/GROUP/etc item to adopt the same
+		 * datatype previously selected for a textually-equivalent tlist item.
+		 * There can't be any implicit cast at top level in an ordinary SELECT
+		 * tlist at this stage, but the case does arise with ORDER BY in an
+		 * aggregate function.
+		 */
+		texpr = strip_implicit_coercions((Node *) tle->expr);
+
+		if (equal(expr, texpr))
+			return tle;
+	}
+
+	/*
+	 * If no matches, construct a new target entry which is appended to the
+	 * end of the target list.  This target is given resjunk = true so that it
+	 * will not be projected into the final tuple.
+	 */
+	target_result = transformTargetEntry(pstate, node, expr, exprKind,
+										 NULL, true);
+
+	*tlist = lappend(*tlist, target_result);
+
+	return target_result;
+}
+
+TargetEntry *
+findTargetlistEntrySQL92(ParseState *pstate, Node *node, List **tlist,
+						 ParseExprKind exprKind)
+{
+	ListCell   *tl;
+
+	/*----------
+	 * Handle two special cases as mandated by the SQL92 spec:
+	 *
+	 * 1. Bare ColumnName (no qualifier or subscripts)
+	 *	  For a bare identifier, we search for a matching column name
+	 *	  in the existing target list.  Multiple matches are an error
+	 *	  unless they refer to identical values; for example,
+	 *	  we allow	SELECT a, a FROM table ORDER BY a
+	 *	  but not	SELECT a AS b, b FROM table ORDER BY b
+	 *	  If no match is found, we fall through and treat the identifier
+	 *	  as an expression.
+	 *	  For GROUP BY, it is incorrect to match the grouping item against
+	 *	  targetlist entries: according to SQL92, an identifier in GROUP BY
+	 *	  is a reference to a column name exposed by FROM, not to a target
+	 *	  list column.  However, many implementations (including pre-7.0
+	 *	  PostgreSQL) accept this anyway.  So for GROUP BY, we look first
+	 *	  to see if the identifier matches any FROM column name, and only
+	 *	  try for a targetlist name if it doesn't.  This ensures that we
+	 *	  adhere to the spec in the case where the name could be both.
+	 *	  DISTINCT ON isn't in the standard, so we can do what we like there;
+	 *	  we choose to make it work like ORDER BY, on the rather flimsy
+	 *	  grounds that ordinary DISTINCT works on targetlist entries.
+	 *
+	 * 2. IntegerConstant
+	 *	  This means to use the n'th item in the existing target list.
+	 *	  Note that it would make no sense to order/group/distinct by an
+	 *	  actual constant, so this does not create a conflict with SQL99.
+	 *	  GROUP BY column-number is not allowed by SQL92, but since
+	 *	  the standard has no other behavior defined for this syntax,
+	 *	  we may as well accept this common extension.
+	 *
+	 * Note that pre-existing resjunk targets must not be used in either case,
+	 * since the user didn't write them in his SELECT list.
+	 *
+	 * If neither special case applies, fall through to treat the item as
+	 * an expression per SQL99.
+	 *----------
+	 */
+	if (IsA(node, ColumnRef) &&
+		list_length(((ColumnRef *) node)->fields) == 1 &&
+		IsA(linitial(((ColumnRef *) node)->fields), String))
+	{
+		char	   *name = strVal(linitial(((ColumnRef *) node)->fields));
+		int			location = ((ColumnRef *) node)->location;
+
+		if (exprKind == EXPR_KIND_GROUP_BY)
+		{
+			/*
+			 * In GROUP BY, we must prefer a match against a FROM-clause
+			 * column to one against the targetlist.  Look to see if there is
+			 * a matching column.  If so, fall through to use SQL99 rules.
+			 * NOTE: if name could refer ambiguously to more than one column
+			 * name exposed by FROM, colNameToVar will ereport(ERROR). That's
+			 * just what we want here.
+			 *
+			 * Small tweak for 7.4.3: ignore matches in upper query levels.
+			 * This effectively changes the search order for bare names to (1)
+			 * local FROM variables, (2) local targetlist aliases, (3) outer
+			 * FROM variables, whereas before it was (1) (3) (2). SQL92 and
+			 * SQL99 do not allow GROUPing BY an outer reference, so this
+			 * breaks no cases that are legal per spec, and it seems a more
+			 * self-consistent behavior.
+			 */
+			if (colNameToVar(pstate, name, true, location) != NULL)
+				name = NULL;
+		}
+
+		if (name != NULL)
+		{
+			TargetEntry *target_result = NULL;
+
+			foreach(tl, *tlist)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(tl);
+
+				if (!tle->resjunk &&
+					strcmp(tle->resname, name) == 0)
+				{
+					if (target_result != NULL)
+					{
+						if (!equal(target_result->expr, tle->expr))
+							ereport(ERROR,
+									(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+
+							/*------
+							  translator: first %s is name of a SQL construct, eg ORDER BY */
+									 errmsg("%s \"%s\" is ambiguous",
+											ParseExprKindName(exprKind),
+											name),
+									 parser_errposition(pstate, location)));
+					}
+					else
+						target_result = tle;
+					/* Stay in loop to check for ambiguity */
+				}
+			}
+			if (target_result != NULL)
+			{
+				/* return the first match, after suitable validation */
+				checkTargetlistEntrySQL92(pstate, target_result, exprKind);
+				return target_result;
+			}
+		}
+	}
+	if (IsA(node, A_Const))
+	{
+		A_Const    *aconst = castNode(A_Const, node);
+		int			targetlist_pos = 0;
+		int			target_pos;
+
+		if (!IsA(&aconst->val, Integer))
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+			/* translator: %s is name of a SQL construct, eg ORDER BY */
+					 errmsg("non-integer constant in %s",
+							ParseExprKindName(exprKind)),
+					 parser_errposition(pstate, aconst->location)));
+
+		target_pos = intVal(&aconst->val);
+		foreach(tl, *tlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(tl);
+
+			if (!tle->resjunk)
+			{
+				if (++targetlist_pos == target_pos)
+				{
+					/* return the unique match, after suitable validation */
+					checkTargetlistEntrySQL92(pstate, tle, exprKind);
+					return tle;
+				}
+			}
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+		/* translator: %s is name of a SQL construct, eg ORDER BY */
+				 errmsg("%s position %d is not in select list",
+						ParseExprKindName(exprKind), target_pos),
+				 parser_errposition(pstate, aconst->location)));
+	}
+
+	/*
+	 * Otherwise, we have an expression, so process it per SQL99 rules.
+	 */
+	return findTargetlistEntrySQL99(pstate, node, tlist, exprKind);
+}
 
 /*
  * transformTargetEntry()

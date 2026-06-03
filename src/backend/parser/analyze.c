@@ -14,7 +14,7 @@
  * contain optimizable statements, which we should transform.
  *
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/parser/analyze.c
@@ -25,7 +25,6 @@
 #include "postgres.h"
 
 #include "access/sysattr.h"
-#include "catalog/dependency.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -101,6 +100,314 @@ static void transformLockingClause(ParseState *pstate, Query *qry,
 static bool test_raw_expression_coverage(Node *node, void *context);
 #endif
 
+typedef struct HavingAliasResolveContext
+{
+	ParseState *pstate;
+	List	   *targetList;
+} HavingAliasResolveContext;
+
+static Node *resolve_having_aliases(ParseState *pstate, List *targetList,
+									Node *node);
+static Node *resolve_having_aliases_mutator(Node *node,
+										HavingAliasResolveContext *context);
+static List *resolve_having_aliases_list(List *list,
+									HavingAliasResolveContext *context);
+static ResTarget *find_having_alias_target(ParseState *pstate,
+										List *targetList,
+										const char *name,
+										int location);
+
+static ResTarget *
+find_having_alias_target(ParseState *pstate, List *targetList,
+						 const char *name, int location)
+{
+	ResTarget  *result = NULL;
+	ListCell   *lc;
+
+	foreach(lc, targetList)
+	{
+		ResTarget  *target = lfirst_node(ResTarget, lc);
+
+		if (target->name == NULL || strcmp(target->name, name) != 0)
+			continue;
+
+		if (result != NULL && !equal(result->val, target->val))
+			ereport(ERROR,
+					(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+					 errmsg("%s \"%s\" is ambiguous",
+							ParseExprKindName(EXPR_KIND_HAVING), name),
+					 parser_errposition(pstate, location)));
+
+		if (result == NULL)
+			result = target;
+	}
+
+	return result;
+}
+
+static List *
+resolve_having_aliases_list(List *list, HavingAliasResolveContext *context)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, list)
+		result = lappend(result,
+						 resolve_having_aliases_mutator((Node *) lfirst(lc),
+												  context));
+
+	return result;
+}
+
+static Node *
+resolve_having_aliases_mutator(Node *node, HavingAliasResolveContext *context)
+{
+	if (node == NULL)
+		return NULL;
+
+	check_stack_depth();
+
+	switch (nodeTag(node))
+	{
+		case T_ColumnRef:
+			{
+				ColumnRef  *cref = castNode(ColumnRef, node);
+
+				if (list_length(cref->fields) == 1 &&
+					IsA(linitial(cref->fields), String))
+				{
+					char	   *name = strVal(linitial(cref->fields));
+					ResTarget  *target;
+
+					target = find_having_alias_target(context->pstate,
+												   context->targetList,
+												   name,
+												   cref->location);
+
+					if (target != NULL)
+						return copyObject(target->val);
+				}
+
+				return copyObject(node);
+			}
+		case T_A_Expr:
+			{
+				A_Expr    *expr = copyObject(node);
+
+				expr->lexpr = resolve_having_aliases_mutator(expr->lexpr, context);
+				expr->rexpr = resolve_having_aliases_mutator(expr->rexpr, context);
+				return (Node *) expr;
+			}
+		case T_BoolExpr:
+			{
+				BoolExpr  *expr = copyObject(node);
+
+				expr->args = resolve_having_aliases_list(expr->args, context);
+				return (Node *) expr;
+			}
+		case T_FuncCall:
+			{
+				FuncCall  *fcall = copyObject(node);
+
+				fcall->args = resolve_having_aliases_list(fcall->args, context);
+				fcall->agg_order = resolve_having_aliases_list(fcall->agg_order,
+															context);
+				fcall->agg_filter = resolve_having_aliases_mutator(fcall->agg_filter,
+															 context);
+				fcall->over = (WindowDef *) resolve_having_aliases_mutator((Node *) fcall->over,
+																	 context);
+				return (Node *) fcall;
+			}
+		case T_NamedArgExpr:
+			{
+				NamedArgExpr *expr = copyObject(node);
+
+				expr->arg = (Expr *) resolve_having_aliases_mutator((Node *) expr->arg,
+																	 context);
+				return (Node *) expr;
+			}
+		case T_A_Indices:
+			{
+				A_Indices *indices = copyObject(node);
+
+				indices->lidx = resolve_having_aliases_mutator(indices->lidx,
+															context);
+				indices->uidx = resolve_having_aliases_mutator(indices->uidx,
+															context);
+				return (Node *) indices;
+			}
+		case T_A_Indirection:
+			{
+				A_Indirection *ind = copyObject(node);
+
+				ind->arg = resolve_having_aliases_mutator(ind->arg, context);
+				ind->indirection = resolve_having_aliases_list(ind->indirection,
+															context);
+				return (Node *) ind;
+			}
+		case T_A_ArrayExpr:
+			{
+				A_ArrayExpr *expr = copyObject(node);
+
+				expr->elements = resolve_having_aliases_list(expr->elements,
+															context);
+				return (Node *) expr;
+			}
+		case T_TypeCast:
+			{
+				TypeCast   *tc = copyObject(node);
+
+				tc->arg = resolve_having_aliases_mutator(tc->arg, context);
+				return (Node *) tc;
+			}
+		case T_CollateClause:
+			{
+				CollateClause *clause = copyObject(node);
+
+				clause->arg = resolve_having_aliases_mutator(clause->arg, context);
+				return (Node *) clause;
+			}
+		case T_SortBy:
+			{
+				SortBy    *sortby = copyObject(node);
+
+				sortby->node = resolve_having_aliases_mutator(sortby->node, context);
+				return (Node *) sortby;
+			}
+		case T_WindowDef:
+			{
+				WindowDef *wd = copyObject(node);
+
+				wd->partitionClause = resolve_having_aliases_list(wd->partitionClause,
+																  context);
+				wd->orderClause = resolve_having_aliases_list(wd->orderClause,
+															context);
+				wd->startOffset = resolve_having_aliases_mutator(wd->startOffset,
+															  context);
+				wd->endOffset = resolve_having_aliases_mutator(wd->endOffset,
+															context);
+				return (Node *) wd;
+			}
+		case T_NullTest:
+			{
+				NullTest  *ntest = copyObject(node);
+
+				ntest->arg = (Expr *) resolve_having_aliases_mutator((Node *) ntest->arg,
+																 context);
+				return (Node *) ntest;
+			}
+		case T_BooleanTest:
+			{
+				BooleanTest *btest = copyObject(node);
+
+				btest->arg = (Expr *) resolve_having_aliases_mutator((Node *) btest->arg,
+																 context);
+				return (Node *) btest;
+			}
+		case T_CaseExpr:
+			{
+				CaseExpr  *caseexpr = copyObject(node);
+
+				caseexpr->arg = (Expr *) resolve_having_aliases_mutator((Node *) caseexpr->arg,
+																	context);
+				caseexpr->args = resolve_having_aliases_list(caseexpr->args, context);
+				caseexpr->defresult = (Expr *) resolve_having_aliases_mutator((Node *) caseexpr->defresult,
+																		  context);
+				return (Node *) caseexpr;
+			}
+		case T_CaseWhen:
+			{
+				CaseWhen  *when = copyObject(node);
+
+				when->expr = (Expr *) resolve_having_aliases_mutator((Node *) when->expr,
+																context);
+				when->result = (Expr *) resolve_having_aliases_mutator((Node *) when->result,
+																  context);
+				return (Node *) when;
+			}
+		case T_RowExpr:
+			{
+				RowExpr   *rowexpr = copyObject(node);
+
+				rowexpr->args = resolve_having_aliases_list(rowexpr->args, context);
+				return (Node *) rowexpr;
+			}
+		case T_CoalesceExpr:
+			{
+				CoalesceExpr *coalesce = copyObject(node);
+
+				coalesce->args = resolve_having_aliases_list(coalesce->args, context);
+				return (Node *) coalesce;
+			}
+		case T_MinMaxExpr:
+			{
+				MinMaxExpr *minmax = copyObject(node);
+
+				minmax->args = resolve_having_aliases_list(minmax->args, context);
+				return (Node *) minmax;
+			}
+		case T_NullIfExpr:
+			{
+				NullIfExpr *nullif = copyObject(node);
+
+				nullif->args = resolve_having_aliases_list(nullif->args, context);
+				return (Node *) nullif;
+			}
+		case T_XmlExpr:
+			{
+				XmlExpr   *xexpr = copyObject(node);
+
+				xexpr->named_args = resolve_having_aliases_list(xexpr->named_args,
+															 context);
+				xexpr->args = resolve_having_aliases_list(xexpr->args, context);
+				return (Node *) xexpr;
+			}
+		case T_XmlSerialize:
+			{
+				XmlSerialize *xs = copyObject(node);
+
+				xs->expr = resolve_having_aliases_mutator(xs->expr, context);
+				return (Node *) xs;
+			}
+		case T_GroupingFunc:
+			{
+				GroupingFunc *g = copyObject(node);
+
+				g->args = resolve_having_aliases_list(g->args, context);
+				return (Node *) g;
+			}
+		case T_GroupingSet:
+			{
+				GroupingSet *gset = copyObject(node);
+
+				gset->content = resolve_having_aliases_list(gset->content, context);
+				return (Node *) gset;
+			}
+		case T_SubLink:
+			{
+				SubLink   *sublink = copyObject(node);
+
+				sublink->testexpr = resolve_having_aliases_mutator(sublink->testexpr,
+															 context);
+				return (Node *) sublink;
+			}
+		case T_List:
+			return (Node *) resolve_having_aliases_list((List *) node, context);
+		default:
+			return copyObject(node);
+	}
+}
+
+static Node *
+resolve_having_aliases(ParseState *pstate, List *targetList, Node *node)
+{
+	HavingAliasResolveContext context;
+
+	context.pstate = pstate;
+	context.targetList = targetList;
+
+	return resolve_having_aliases_mutator(node, &context);
+}
 
 /*
  * parse_analyze_fixedparams
@@ -429,7 +736,7 @@ transformStmt(ParseState *pstate, Node *parseTree)
 			 */
 			result = makeNode(Query);
 			result->commandType = CMD_UTILITY;
-			result->utilityStmt = parseTree;
+			result->utilityStmt = (Node *) parseTree;
 			break;
 	}
 
@@ -1450,9 +1757,19 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt,
 	qual = transformWhereClause(pstate, stmt->whereClause,
 								EXPR_KIND_WHERE, "WHERE");
 
-	/* initial processing of HAVING clause is much like WHERE clause */
-	qry->havingQual = transformWhereClause(pstate, stmt->havingClause,
-										   EXPR_KIND_HAVING, "HAVING");
+	if (stmt->havingClause)
+	{
+		Node	   *having_with_aliases;
+
+		having_with_aliases = resolve_having_aliases(pstate,
+												 stmt->targetList,
+												 stmt->havingClause);
+
+		qry->havingQual = transformWhereClause(pstate, having_with_aliases,
+											EXPR_KIND_HAVING, "HAVING");
+	}
+	else
+		qry->havingQual = NULL;
 
 	/*
 	 * Transform sorting/grouping stuff.  Do ORDER BY first because both
@@ -2641,7 +2958,8 @@ addNSItemForReturning(ParseState *pstate, const char *aliasname,
 	colnames = pstate->p_target_nsitem->p_rte->eref->colnames;
 	numattrs = list_length(colnames);
 
-	nscolumns = palloc_array(ParseNamespaceColumn, numattrs);
+	nscolumns = (ParseNamespaceColumn *)
+		palloc(numattrs * sizeof(ParseNamespaceColumn));
 
 	memcpy(nscolumns, pstate->p_target_nsitem->p_nscolumns,
 		   numattrs * sizeof(ParseNamespaceColumn));
@@ -2651,7 +2969,7 @@ addNSItemForReturning(ParseState *pstate, const char *aliasname,
 		nscolumns[i].p_varreturningtype = returning_type;
 
 	/* build the nsitem, copying most fields from the target relation */
-	nsitem = palloc_object(ParseNamespaceItem);
+	nsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
 	nsitem->p_names = makeAlias(aliasname, colnames);
 	nsitem->p_rte = pstate->p_target_nsitem->p_rte;
 	nsitem->p_rtindex = pstate->p_target_nsitem->p_rtindex;
@@ -3129,8 +3447,6 @@ transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 	/* additional work needed for CREATE MATERIALIZED VIEW */
 	if (stmt->objtype == OBJECT_MATVIEW)
 	{
-		ObjectAddress temp_object;
-
 		/*
 		 * Prohibit a data-modifying CTE in the query used to create a
 		 * materialized view. It's not sufficiently clear what the user would
@@ -3146,12 +3462,10 @@ transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 		 * creation query. It would be hard to refresh data or incrementally
 		 * maintain it if a source disappeared.
 		 */
-		if (query_uses_temp_object(query, &temp_object))
+		if (isQueryUsingTempRelation(query))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("materialized views must not use temporary objects"),
-					 errdetail("This view depends on temporary %s.",
-							   getObjectDescription(&temp_object, false))));
+					 errmsg("materialized views must not use temporary tables or views")));
 
 		/*
 		 * A materialized view would either need to save parameters for use in

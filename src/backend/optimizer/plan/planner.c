@@ -3,7 +3,7 @@
  * planner.c
  *	  The query optimizer external interface.
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -138,7 +138,7 @@ typedef struct
 static Node *preprocess_expression(PlannerInfo *root, Node *expr, int kind);
 static void preprocess_qual_conditions(PlannerInfo *root, Node *jtnode);
 static void grouping_planner(PlannerInfo *root, double tuple_fraction,
-							 SetOperationStmt *setops);
+							 SetOperationStmt *setops, List *windowHavingQual);
 static grouping_sets_data *preprocess_grouping_sets(PlannerInfo *root);
 static List *remap_to_groupclause_idx(List *groupClause, List *gsets,
 									  int *tleref_to_colnum_map);
@@ -187,14 +187,16 @@ static RelOptInfo *create_window_paths(PlannerInfo *root,
 									   PathTarget *output_target,
 									   bool output_target_parallel_safe,
 									   WindowFuncLists *wflists,
-									   List *activeWindows);
+									   List *activeWindows,
+									   List *windowQual);
 static void create_one_window_path(PlannerInfo *root,
 								   RelOptInfo *window_rel,
 								   Path *path,
 								   PathTarget *input_target,
 								   PathTarget *output_target,
 								   WindowFuncLists *wflists,
-								   List *activeWindows);
+								   List *activeWindows,
+								   List *windowQual);
 static RelOptInfo *create_distinct_paths(PlannerInfo *root,
 										 RelOptInfo *input_rel,
 										 PathTarget *target);
@@ -223,6 +225,8 @@ static void optimize_window_clauses(PlannerInfo *root,
 									WindowFuncLists *wflists);
 static List *select_active_windows(PlannerInfo *root, WindowFuncLists *wflists);
 static void name_active_windows(List *activeWindows);
+static void add_window_qual_to_processed_tlist(PlannerInfo *root,
+											 List *windowQual);
 static PathTarget *make_window_input_target(PlannerInfo *root,
 											PathTarget *final_target,
 											List *activeWindows);
@@ -697,6 +701,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	PlannerInfo *root;
 	List	   *newWithCheckOptions;
 	List	   *newHaving;
+	List	   *windowHavingQual = NIL;
 	bool		hasOuterJoins;
 	bool		hasResultRTEs;
 	RelOptInfo *final_rel;
@@ -1123,6 +1128,35 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 			flatten_group_exprs(root, root->parse, parse->havingQual);
 	}
 
+
+	if (parse->hasWindowFuncs && parse->havingQual)
+	{
+		if (parse->hasAggs || parse->groupClause || parse->groupingSets)
+		{
+			List	   *groupHaving = NIL;
+			ListCell   *lc;
+
+			foreach(lc, (List *) parse->havingQual)
+			{
+				Node	   *havingclause = (Node *) lfirst(lc);
+
+				if (contain_windowfuncs(havingclause))
+					windowHavingQual = lappend(windowHavingQual, havingclause);
+				else
+					groupHaving = lappend(groupHaving, havingclause);
+			}
+
+			parse->havingQual = (Node *) groupHaving;
+		}
+		else if (contain_windowfuncs(parse->havingQual))
+		{
+			windowHavingQual = (List *) parse->havingQual;
+			parse->havingQual = NULL;
+		}
+
+		root->hasHavingQual = (parse->havingQual != NULL);
+	}
+
 	/* Constant-folding might have removed all set-returning functions */
 	if (parse->hasTargetSRFs)
 		parse->hasTargetSRFs = expression_returns_set((Node *) parse->targetList);
@@ -1248,7 +1282,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	/*
 	 * Do the main planning.
 	 */
-	grouping_planner(root, tuple_fraction, setops);
+	grouping_planner(root, tuple_fraction, setops, windowHavingQual);
 
 	/*
 	 * Capture the set of outer-level param IDs we have access to, for use in
@@ -1462,7 +1496,7 @@ preprocess_phv_expression(PlannerInfo *root, Expr *expr)
  */
 static void
 grouping_planner(PlannerInfo *root, double tuple_fraction,
-				 SetOperationStmt *setops)
+				 SetOperationStmt *setops, List *windowHavingQual)
 {
 	Query	   *parse = root->parse;
 	int64		offset_est = 0;
@@ -1607,7 +1641,11 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		{
 			preprocess_aggrefs(root, (Node *) root->processed_tlist);
 			preprocess_aggrefs(root, (Node *) parse->havingQual);
+			preprocess_aggrefs(root, (Node *) windowHavingQual);
 		}
+
+		if (windowHavingQual)
+			add_window_qual_to_processed_tlist(root, windowHavingQual);
 
 		/*
 		 * Locate any window functions in the tlist.  (We don't need to look
@@ -1774,10 +1812,9 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 			sort_input_target = linitial_node(PathTarget, sort_input_targets);
 			Assert(!linitial_int(sort_input_targets_contain_srfs));
 			/* likewise for grouping_target vs. scanjoin_target */
-			split_pathtarget_at_srfs_grouping(root,
-											  grouping_target, scanjoin_target,
-											  &grouping_targets,
-											  &grouping_targets_contain_srfs);
+			split_pathtarget_at_srfs(root, grouping_target, scanjoin_target,
+									 &grouping_targets,
+									 &grouping_targets_contain_srfs);
 			grouping_target = linitial_node(PathTarget, grouping_targets);
 			Assert(!linitial_int(grouping_targets_contain_srfs));
 			/* scanjoin_target will not have any SRFs precomputed for it */
@@ -1850,7 +1887,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 											  sort_input_target,
 											  sort_input_target_parallel_safe,
 											  wflists,
-											  activeWindows);
+											  activeWindows,
+											  windowHavingQual);
 			/* Fix things up if sort_input_target contains SRFs */
 			if (parse->hasTargetSRFs)
 				adjust_paths_for_srfs(root, current_rel,
@@ -2214,7 +2252,7 @@ preprocess_grouping_sets(PlannerInfo *root)
 	List	   *sets;
 	int			maxref = 0;
 	ListCell   *lc_set;
-	grouping_sets_data *gd = palloc0_object(grouping_sets_data);
+	grouping_sets_data *gd = palloc0(sizeof(grouping_sets_data));
 
 	/*
 	 * We don't currently make any attempt to optimize the groupClause when
@@ -3950,7 +3988,7 @@ make_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	 * target list and HAVING quals are parallel-safe.
 	 */
 	if (input_rel->consider_parallel && target_parallel_safe &&
-		is_parallel_safe(root, havingQual))
+		is_parallel_safe(root, (Node *) havingQual))
 		grouped_rel->consider_parallel = true;
 
 	/*
@@ -4556,7 +4594,8 @@ create_window_paths(PlannerInfo *root,
 					PathTarget *output_target,
 					bool output_target_parallel_safe,
 					WindowFuncLists *wflists,
-					List *activeWindows)
+					List *activeWindows,
+					List *windowQual)
 {
 	RelOptInfo *window_rel;
 	ListCell   *lc;
@@ -4601,7 +4640,8 @@ create_window_paths(PlannerInfo *root,
 								   input_target,
 								   output_target,
 								   wflists,
-								   activeWindows);
+								   activeWindows,
+								   windowQual);
 	}
 
 	/*
@@ -4643,11 +4683,12 @@ create_one_window_path(PlannerInfo *root,
 					   PathTarget *input_target,
 					   PathTarget *output_target,
 					   WindowFuncLists *wflists,
-					   List *activeWindows)
+					   List *activeWindows,
+					   List *windowQual)
 {
 	PathTarget *window_target;
 	ListCell   *l;
-	List	   *topqual = NIL;
+	List	   *topqual = list_copy(windowQual);
 
 	/*
 	 * Since each window clause could require a different sort order, we stack
@@ -5978,8 +6019,8 @@ select_active_windows(PlannerInfo *root, WindowFuncLists *wflists)
 	List	   *result = NIL;
 	ListCell   *lc;
 	int			nActive = 0;
-	WindowClauseSortData *actives = palloc_array(WindowClauseSortData,
-												 list_length(windowClause));
+	WindowClauseSortData *actives = palloc(sizeof(WindowClauseSortData)
+										   * list_length(windowClause));
 
 	/* First, construct an array of the active windows */
 	foreach(lc, windowClause)
@@ -6139,6 +6180,54 @@ common_prefix_cmp(const void *a, const void *b)
 		return 1;
 
 	return 0;
+}
+
+
+static void
+add_window_qual_to_processed_tlist(PlannerInfo *root, List *windowQual)
+{
+	WindowFuncLists *wflists;
+	int			maxWinRef;
+	int			winref;
+	ListCell   *lc;
+
+	foreach(lc, windowQual)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+
+		if (tlist_member(expr, root->processed_tlist) == NULL)
+		{
+			TargetEntry *tle;
+
+			tle = makeTargetEntry((Expr *) copyObject(expr),
+								  list_length(root->processed_tlist) + 1,
+								  NULL,
+								  true);
+			root->processed_tlist = lappend(root->processed_tlist, tle);
+		}
+	}
+
+	maxWinRef = list_length(root->parse->windowClause);
+	wflists = find_window_functions((Node *) windowQual, maxWinRef);
+
+	for (winref = 1; winref <= maxWinRef; winref++)
+	{
+		foreach(lc, wflists->windowFuncs[winref])
+		{
+			WindowFunc *wfunc = lfirst_node(WindowFunc, lc);
+
+			if (tlist_member((Expr *) wfunc, root->processed_tlist) == NULL)
+			{
+				TargetEntry *tle;
+
+				tle = makeTargetEntry((Expr *) copyObject(wfunc),
+									  list_length(root->processed_tlist) + 1,
+									  NULL,
+									  true);
+				root->processed_tlist = lappend(root->processed_tlist, tle);
+			}
+		}
+	}
 }
 
 /*
@@ -7907,23 +7996,17 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	check_stack_depth();
 
 	/*
-	 * If the rel only has Append and MergeAppend paths, we want to drop its
-	 * existing paths and generate new ones.  This function would still be
-	 * correct if we kept the existing paths: we'd modify them to generate the
-	 * correct target above the partitioning Append, and then they'd compete
-	 * on cost with paths generating the target below the Append.  However, in
-	 * our current cost model the latter way is always the same or cheaper
-	 * cost, so modifying the existing paths would just be useless work.
-	 * Moreover, when the cost is the same, varying roundoff errors might
-	 * sometimes allow an existing path to be picked, resulting in undesirable
-	 * cross-platform plan variations.  So we drop old paths and thereby force
-	 * the work to be done below the Append.
-	 *
-	 * However, there are several cases when this optimization is not safe. If
-	 * the rel isn't partitioned, then none of the paths will be Append or
-	 * MergeAppend paths, so we should definitely not do this. If it is
-	 * partitioned but is a joinrel, it may have Append and MergeAppend paths,
-	 * but it can also have join paths that we can't afford to discard.
+	 * If the rel is partitioned, we want to drop its existing paths and
+	 * generate new ones.  This function would still be correct if we kept the
+	 * existing paths: we'd modify them to generate the correct target above
+	 * the partitioning Append, and then they'd compete on cost with paths
+	 * generating the target below the Append.  However, in our current cost
+	 * model the latter way is always the same or cheaper cost, so modifying
+	 * the existing paths would just be useless work.  Moreover, when the cost
+	 * is the same, varying roundoff errors might sometimes allow an existing
+	 * path to be picked, resulting in undesirable cross-platform plan
+	 * variations.  So we drop old paths and thereby force the work to be done
+	 * below the Append, except in the case of a non-parallel-safe target.
 	 *
 	 * Some care is needed, because we have to allow
 	 * generate_useful_gather_paths to see the old partial paths in the next
@@ -7931,7 +8014,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 * generate_useful_gather_paths to add path(s) to the main list, and
 	 * finally zap the partial pathlist.
 	 */
-	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
+	if (rel_is_partitioned)
 		rel->pathlist = NIL;
 
 	/*
@@ -7957,7 +8040,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	}
 
 	/* Finish dropping old paths for a partitioned rel, per comment above */
-	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
+	if (rel_is_partitioned)
 		rel->partial_pathlist = NIL;
 
 	/* Extract SRF-free scan/join target. */
@@ -8532,7 +8615,7 @@ create_unique_paths(PlannerInfo *root, RelOptInfo *rel, SpecialJoinInfo *sjinfo)
 			tle = tlist_member(uniqexpr, newtlist);
 			if (!tle)
 			{
-				tle = makeTargetEntry(uniqexpr,
+				tle = makeTargetEntry((Expr *) uniqexpr,
 									  nextresno,
 									  NULL,
 									  false);

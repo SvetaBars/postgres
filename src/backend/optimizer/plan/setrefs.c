@@ -4,7 +4,7 @@
  *	  Post-processing of a completed plan tree: fix references to subplan
  *	  vars, compute regproc values for operators, etc
  *
- * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -312,7 +312,7 @@ set_plan_references(PlannerInfo *root, Plan *plan)
 			   root->simple_rte_array[rc->rti] != NULL);
 
 		/* flat copy is enough since all fields are scalars */
-		newrc = palloc_object(PlanRowMark);
+		newrc = (PlanRowMark *) palloc(sizeof(PlanRowMark));
 		memcpy(newrc, rc, sizeof(PlanRowMark));
 
 		/* adjust indexes ... but *not* the rowmarkId */
@@ -545,7 +545,7 @@ add_rte_to_flat_rtable(PlannerGlobal *glob, List *rteperminfos,
 	RangeTblEntry *newrte;
 
 	/* flat copy to duplicate all the scalar fields */
-	newrte = palloc_object(RangeTblEntry);
+	newrte = (RangeTblEntry *) palloc(sizeof(RangeTblEntry));
 	memcpy(newrte, rte, sizeof(RangeTblEntry));
 
 	/* zap unneeded sub-structure */
@@ -991,6 +991,10 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 																			(Plan *) wplan);
 
 				set_upper_references(root, plan, rtoffset);
+
+				wplan->plan.qual = set_windowagg_runcondition_references(root,
+													 wplan->plan.qual,
+													 (Plan *) wplan);
 
 				/*
 				 * Like Limit node limit/offset expressions, WindowAgg has
@@ -2028,7 +2032,7 @@ offset_relid_set(Relids relids, int rtoffset)
 static inline Var *
 copyVar(Var *var)
 {
-	Var		   *newvar = palloc_object(Var);
+	Var		   *newvar = (Var *) palloc(sizeof(Var));
 
 	*newvar = *var;
 	return newvar;

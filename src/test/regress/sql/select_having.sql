@@ -62,4 +62,16 @@ SELECT 1 AS one FROM test_having HAVING 1 < 2;
 -- and just to prove that we aren't scanning the table:
 SELECT 1 AS one FROM test_having WHERE 1/a = 1 HAVING 1 < 2;
 
+SELECT a, b, sum(a) OVER (PARTITION BY b) AS s FROM test_having
+	HAVING s >= 12 ORDER BY a;
+
+SELECT a, b, sum(a) OVER () AS total FROM test_having
+	HAVING total = 45 AND a > 7 ORDER BY a;
+
+SELECT a, b FROM test_having
+	HAVING row_number() OVER (ORDER BY a) <= 3 ORDER BY a;
+
+SELECT b, count(*) AS c, sum(count(*)) OVER () AS total FROM test_having
+	GROUP BY b HAVING c > 1 AND total = 9 ORDER BY b;
+
 DROP TABLE test_having;

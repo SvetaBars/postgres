@@ -1854,7 +1854,8 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt,
 	assign_query_collations(pstate, qry);
 
 	/* this must be done after collations, for reliable comparison of exprs */
-	if (pstate->p_hasAggs || qry->groupClause || qry->groupingSets || qry->havingQual)
+	if (pstate->p_hasAggs || qry->groupClause || qry->groupingSets ||
+		(qry->havingQual && !contain_windowfuncs(qry->havingQual)))
 		parseCheckAggregates(pstate, qry);
 
 	return qry;
@@ -2331,7 +2332,8 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 	assign_query_collations(pstate, qry);
 
 	/* this must be done after collations, for reliable comparison of exprs */
-	if (pstate->p_hasAggs || qry->groupClause || qry->groupingSets || qry->havingQual)
+	if (pstate->p_hasAggs || qry->groupClause || qry->groupingSets ||
+		(qry->havingQual && !contain_windowfuncs(qry->havingQual)))
 		parseCheckAggregates(pstate, qry);
 
 	return qry;

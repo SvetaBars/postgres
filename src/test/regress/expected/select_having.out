@@ -126,4 +126,43 @@ SELECT 1 AS one FROM test_having WHERE 1/a = 1 HAVING 1 < 2;
    1
 (1 row)
 
+SELECT a, b, sum(a) OVER (PARTITION BY b) AS s FROM test_having
+	HAVING s >= 12 ORDER BY a;
+ a | b | s  
+---+---+----
+ 3 | 3 | 12
+ 4 | 3 | 12
+ 5 | 3 | 12
+ 6 | 4 | 30
+ 7 | 4 | 30
+ 8 | 4 | 30
+ 9 | 4 | 30
+(7 rows)
+
+SELECT a, b, sum(a) OVER () AS total FROM test_having
+	HAVING total = 45 AND a > 7 ORDER BY a;
+ a | b | total 
+---+---+-------
+ 8 | 4 |    45
+ 9 | 4 |    45
+(2 rows)
+
+SELECT a, b FROM test_having
+	HAVING row_number() OVER (ORDER BY a) <= 3 ORDER BY a;
+ a | b 
+---+---
+ 0 | 1
+ 1 | 2
+ 2 | 2
+(3 rows)
+
+SELECT b, count(*) AS c, sum(count(*)) OVER () AS total FROM test_having
+	GROUP BY b HAVING c > 1 AND total = 9 ORDER BY b;
+ b | c | total 
+---+---+-------
+ 2 | 2 |     9
+ 3 | 3 |     9
+ 4 | 4 |     9
+(3 rows)
+
 DROP TABLE test_having;
